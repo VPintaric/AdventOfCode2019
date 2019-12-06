@@ -1,6 +1,3 @@
-//
-// Created by wex on 12/2/19.
-//
 
 #include <cstdio>
 #include <vector>
