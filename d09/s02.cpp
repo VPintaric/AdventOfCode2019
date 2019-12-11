@@ -9,9 +9,7 @@
 #include <queue>
 #include <list>
 
-#include "bigint.h"
-
-using bigint = integer;
+using bigint = long long;
 
 constexpr int INITIAL_MEMORY = 10000;
 constexpr int BLOCKS_MIN_DISTANCE = 100;
@@ -298,7 +296,7 @@ int main() {
 
     int i = 0;
     for ( std::string s; std::getline( ss, s, ',' ); ++i ) {
-        memory.write( i, bigint( s, 10 ));
+        memory.write( i, std::stoll( s ));
     }
 
     program.reset( memory );
