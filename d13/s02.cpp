@@ -8,11 +8,15 @@
 #include <algorithm>
 #include <queue>
 #include <list>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <map>
 
 using bigint = long long;
 
 constexpr int INITIAL_MEMORY = 10000;
-constexpr int BLOCKS_MIN_DISTANCE = 1000;
+constexpr int BLOCKS_MIN_DISTANCE = 100;
 
 class Memory {
     std::list< std::vector< bigint > > blocks;
@@ -29,6 +33,7 @@ public:
         auto startAddr = blocksStartAddr.begin();
         for ( ; block != blocks.end(); ++block, ++startAddr ) {
             if ( addr < *startAddr ) {
+
                 blocks.insert( block, std::vector< bigint >( 1 ));
                 blocksStartAddr.insert( startAddr, addr );
                 --block;
@@ -104,8 +109,11 @@ class Program {
     Memory memory;
     std::queue< bigint > input;
     std::queue< bigint > output;
-    bigint pc;
-    bigint rbo;
+    bigint pc{};
+    bigint rbo{};
+    std::mutex iMut, oMut, isRunningMut;
+    std::condition_variable iCv, oCv;
+    bool isRunning{ false };
 
     bigint getParam( const bigint &command, int n ) {
         auto argMode = ( command / static_cast<int>(std::pow( 10, n + 1 ))) % 10;
@@ -152,35 +160,7 @@ class Program {
         }
     }
 
-public:
-    void reset( const Memory &initial ) {
-        pc = 0;
-        rbo = 0;
-        memory = initial;
-        std::queue< bigint >().swap( input );
-        std::queue< bigint >().swap( output );
-    }
-
-    void pushInput( const bigint &in ) {
-        input.push( in );
-    }
-
-    bigint popOutput() {
-        if ( output.empty()) {
-            std::cout << "Empty output queue" << std::endl;
-            return 0;
-        }
-
-        auto out = output.front();
-        output.pop();
-        return out;
-    }
-
-    bool hasOutput() {
-        return !output.empty();
-    }
-
-    bool run() {
+    void run() {
         bool done = false;
 
         while ( !done ) {
@@ -206,20 +186,18 @@ public:
                     pc += 4;
                     break;
                 case Opcode::INP:
-                    if ( input.empty()) {
-                        std::cout << "Input is empty" << std::endl;
-                        return false;
-                    }
-
+                    if ( !popInput( p1 )) {
+                        done = true;
+                        break;
+                    };
                     dst = getDstAddr( command, 1 );
-                    memory.write( dst, input.front());
-                    input.pop();
+                    memory.write( dst, p1 );
 
                     pc += 2;
                     break;
                 case Opcode::OUT:
                     p1 = getParam( command, 1 );
-                    output.push( p1 );
+                    pushOutput( p1 );
 
                     pc += 2;
                     break;
@@ -272,6 +250,8 @@ public:
                     pc += 2;
                     break;
                 case Opcode::HLT:
+                    std::cout << "HALT" << std::endl;
+                    exit( 1 );
                     done = true;
                     break;
                 default:
@@ -280,10 +260,105 @@ public:
             }
         }
 
+        setIsRunning( false );
+    }
+
+    bool popInput( bigint &out ) {
+        std::unique_lock< std::mutex > lock( iMut );
+        if ( input.empty() && stopWhenNoInput ) {
+            std::cout << "NO INPUT" << std::endl;
+            return false;
+        }
+        iCv.wait( lock, [ this ] { return !input.empty(); } );
+
+        out = input.front();
+        input.pop();
         return true;
+    }
+
+    void pushOutput( const bigint &out ) {
+        {
+            std::lock_guard< std::mutex > lock( oMut );
+            output.push( out );
+        }
+        oCv.notify_one();
+    }
+
+    void setIsRunning( bool to ) {
+        {
+            std::lock_guard< std::mutex > lock( isRunningMut );
+            isRunning = to;
+        }
+        oCv.notify_one();
+    }
+
+public:
+    bool stopWhenNoInput{ false };
+
+    void reset( const Memory &initial ) {
+        pc = 0;
+        rbo = 0;
+        memory = initial;
+        std::queue< bigint >().swap( input );
+        std::queue< bigint >().swap( output );
+    }
+
+    void pushInput( const bigint &in ) {
+        {
+            std::lock_guard< std::mutex > lock( iMut );
+            input.push( in );
+        }
+        iCv.notify_one();
+    }
+
+    bool popOutput( bigint &out ) {
+        std::unique_lock< std::mutex > lock( oMut );
+
+        if ( output.empty()) {
+            oCv.wait( lock, [ this ] { return !output.empty() || isDone(); } );
+        }
+
+        if ( output.empty()) {
+            return false;
+        }
+
+        out = output.front();
+        output.pop();
+        return true;
+    }
+
+    std::thread start() {
+        isRunning = true;
+        return std::thread( [ this ] { this->run(); } );
+    }
+
+    bool isDone() {
+        std::lock_guard< std::mutex > lock( isRunningMut );
+        return !isRunning;
     }
 };
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Point {
+    int x, y;
+
+    bool operator<( const Point &o ) const {
+        if ( x == o.x ) {
+            return y < o.y;
+        } else {
+            return x < o.x;
+        }
+    }
+
+    Point operator+( const Point &o ) const {
+        return { x + o.x, y + o.y };
+    }
+
+    Point operator-( const Point &o ) const {
+        return { x - o.x, y - o.y };
+    }
+};
 
 int main() {
     Memory memory;
@@ -298,13 +373,120 @@ int main() {
         memory.write( i, std::stoll( s ));
     }
 
+    memory.write( 0, 2 );
     program.reset( memory );
-    program.pushInput( 1 );
-    program.run();
+    program.stopWhenNoInput = true;
 
-    while ( program.hasOutput()) {
-        std::cout << program.popOutput() << std::endl;
-    }
+    int nBlocks = 0;
+    int score = 0;
+    Point paddlePos{}, ballPos{};
+
+    std::map< Point, int > grid;
+
+    constexpr bool printGrid = true;
+    constexpr bool printStats = true;
+
+    do {
+        auto execution = program.start();
+
+        while ( !program.isDone()) {
+            Point pos{};
+            int id;
+            bigint out;
+
+            if ( !program.popOutput( out )) break;
+            pos.x = static_cast<int>(out);
+
+            if ( !program.popOutput( out )) break;
+            pos.y = static_cast<int>(out);
+
+            if ( !program.popOutput( out )) break;
+            id = static_cast<int>(out);
+
+            if ( pos.x == -1 && pos.y == 0 ) {
+                score = id;
+            } else {
+                switch ( id ) {
+                    case 3:
+                        paddlePos = pos;
+                        break;
+                    case 4:
+                        ballPos = pos;
+                        break;
+                    default:
+                        // intentional NOP
+                        break;
+                }
+
+                auto iter = grid.find( pos );
+                if ( id == 2 ) {
+                    if ( iter == grid.end() || iter->second != 2 ) {
+                        ++nBlocks;
+                    }
+                } else {
+                    if ( iter != grid.end() && iter->second == 2 ) {
+                        --nBlocks;
+                    }
+                }
+                grid[ pos ] = id;
+            }
+        }
+
+        execution.join();
+
+        if ( printGrid ) {
+            for ( int y = 0; y < 21; ++y ) {
+                for ( int x = 0; x < 40; ++x ) {
+                    auto iter = grid.find( { x, y } );
+                    if ( iter == grid.end()) {
+                        std::cout << ' ';
+                        continue;
+                    }
+
+                    switch ( iter->second ) {
+                        case 0:
+                            std::cout << " ";
+                            break;
+                        case 1:
+                            std::cout << "#";
+                            break;
+                        case 2:
+                            std::cout << "=";
+                            break;
+                        case 3:
+                            std::cout << "-";
+                            break;
+                        case 4:
+                            std::cout << "O";
+                            break;
+                        default:
+                            std::cout << "E";
+                            break;
+                    }
+                }
+                std::cout << std::endl;
+            }
+        }
+
+        if ( printStats ) {
+            std::cout << "Ball: " << ballPos.x << " " << ballPos.y << std::endl;
+            std::cout << "Paddle: " << paddlePos.x << " " << paddlePos.y << std::endl;
+            std::cout << "Block count: " << nBlocks << std::endl;
+            std::cout << "Score: " << score << std::endl << std::endl;
+        }
+
+        if ( ballPos.x < paddlePos.x ) {
+            program.pushInput( -1 );
+        } else if ( ballPos.x > paddlePos.x ) {
+            program.pushInput( 1 );
+        } else {
+            program.pushInput( 0 );
+        }
+
+    } while ( nBlocks > 0 );
+
+
+    std::cout << score << std::endl;
 
     return 0;
 }

@@ -8,11 +8,15 @@
 #include <algorithm>
 #include <queue>
 #include <list>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <map>
 
 using bigint = long long;
 
 constexpr int INITIAL_MEMORY = 10000;
-constexpr int BLOCKS_MIN_DISTANCE = 1000;
+constexpr int BLOCKS_MIN_DISTANCE = 100;
 
 class Memory {
     std::list< std::vector< bigint > > blocks;
@@ -29,6 +33,7 @@ public:
         auto startAddr = blocksStartAddr.begin();
         for ( ; block != blocks.end(); ++block, ++startAddr ) {
             if ( addr < *startAddr ) {
+
                 blocks.insert( block, std::vector< bigint >( 1 ));
                 blocksStartAddr.insert( startAddr, addr );
                 --block;
@@ -104,8 +109,11 @@ class Program {
     Memory memory;
     std::queue< bigint > input;
     std::queue< bigint > output;
-    bigint pc;
-    bigint rbo;
+    bigint pc{};
+    bigint rbo{};
+    std::mutex iMut, oMut;
+    std::condition_variable iCv, oCv;
+    bool isRunning{ false };
 
     bigint getParam( const bigint &command, int n ) {
         auto argMode = ( command / static_cast<int>(std::pow( 10, n + 1 ))) % 10;
@@ -152,35 +160,7 @@ class Program {
         }
     }
 
-public:
-    void reset( const Memory &initial ) {
-        pc = 0;
-        rbo = 0;
-        memory = initial;
-        std::queue< bigint >().swap( input );
-        std::queue< bigint >().swap( output );
-    }
-
-    void pushInput( const bigint &in ) {
-        input.push( in );
-    }
-
-    bigint popOutput() {
-        if ( output.empty()) {
-            std::cout << "Empty output queue" << std::endl;
-            return 0;
-        }
-
-        auto out = output.front();
-        output.pop();
-        return out;
-    }
-
-    bool hasOutput() {
-        return !output.empty();
-    }
-
-    bool run() {
+    void run() {
         bool done = false;
 
         while ( !done ) {
@@ -206,20 +186,18 @@ public:
                     pc += 4;
                     break;
                 case Opcode::INP:
-                    if ( input.empty()) {
-                        std::cout << "Input is empty" << std::endl;
-                        return false;
-                    }
-
+                    if ( !popInput( p1 )) {
+                        done = true;
+                        return;
+                    };
                     dst = getDstAddr( command, 1 );
-                    memory.write( dst, input.front());
-                    input.pop();
+                    memory.write( dst, p1 );
 
                     pc += 2;
                     break;
                 case Opcode::OUT:
                     p1 = getParam( command, 1 );
-                    output.push( p1 );
+                    pushOutput( p1 );
 
                     pc += 2;
                     break;
@@ -280,10 +258,93 @@ public:
             }
         }
 
+        setIsRunning( false );
+    }
+
+    bool popInput( bigint &out ) {
+        std::unique_lock< std::mutex > lock( iMut );
+        if ( input.empty() && stopWhenNoInput ) {
+            return false;
+        }
+        iCv.wait( lock, [ this ] { return !input.empty(); } );
+
+        out = input.front();
+        input.pop();
         return true;
+    }
+
+    void pushOutput( const bigint &out ) {
+        {
+            std::lock_guard< std::mutex > lock( oMut );
+            output.push( out );
+        }
+        oCv.notify_one();
+    }
+
+    void setIsRunning( bool to ) {
+        {
+            std::lock_guard< std::mutex > lock( oMut );
+            isRunning = to;
+        }
+        oCv.notify_one();
+    }
+
+public:
+    bool stopWhenNoInput{ false };
+
+    void reset( const Memory &initial ) {
+        pc = 0;
+        rbo = 0;
+        memory = initial;
+        std::queue< bigint >().swap( input );
+        std::queue< bigint >().swap( output );
+    }
+
+    void pushInput( const bigint &in ) {
+        {
+            std::lock_guard< std::mutex > lock( iMut );
+            input.push( in );
+        }
+        iCv.notify_one();
+    }
+
+    bool popOutput( bigint &out ) {
+        std::unique_lock< std::mutex > lock( oMut );
+        oCv.wait( lock, [ this ] { return !output.empty() || !isRunning; } );
+
+        if ( output.empty()) {
+            return false;
+        }
+
+        out = output.front();
+        output.pop();
+        return true;
+    }
+
+    std::thread start() {
+        isRunning = true;
+        return std::thread( [ this ] { this->run(); } );
+    }
+
+    bool isDone() {
+        std::lock_guard< std::mutex > lock( oMut );
+        return !isRunning;
     }
 };
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Point {
+    int x, y;
+
+    bool operator<( const Point &o ) const {
+        if ( x == o.x ) {
+            return y < o.y;
+        } else {
+            return x < o.x;
+        }
+    }
+};
 
 int main() {
     Memory memory;
@@ -298,13 +359,33 @@ int main() {
         memory.write( i, std::stoll( s ));
     }
 
+    memory.write( 2, 0 );
     program.reset( memory );
-    program.pushInput( 1 );
-    program.run();
+    auto execution = program.start();
 
-    while ( program.hasOutput()) {
-        std::cout << program.popOutput() << std::endl;
+    int nBlocks = 0;
+    while ( !program.isDone()) {
+        Point pos{};
+        int id;
+        bigint out;
+
+        if ( !program.popOutput( out )) break;
+        pos.x = static_cast<int>(out);
+
+        if ( !program.popOutput( out )) break;
+        pos.y = static_cast<int>(out);
+
+        if ( !program.popOutput( out )) break;
+        id = static_cast<int>(out);
+
+        if ( id == 2 ) {
+            ++nBlocks;
+        }
     }
+
+    execution.join();
+
+    std::cout << nBlocks << std::endl;
 
     return 0;
 }
