@@ -111,9 +111,9 @@ class Program {
     std::queue< bigint > output;
     bigint pc{};
     bigint rbo{};
-    std::mutex iMut, oMut, isRunningMut;
+    std::mutex iMut, oMut, isRunningMut, hasHaltedMut;
     std::condition_variable iCv, oCv;
-    bool isRunning{ false };
+    bool isRunning{ false }, hasHalted{ false };
 
     bigint getParam( const bigint &command, int n ) {
         auto argMode = ( command / static_cast<int>(std::pow( 10, n + 1 ))) % 10;
@@ -251,7 +251,7 @@ class Program {
                     break;
                 case Opcode::HLT:
                     std::cout << "HALT" << std::endl;
-                    exit( 1 );
+                    setHasHalted( true );
                     done = true;
                     break;
                 default:
@@ -292,6 +292,11 @@ class Program {
         oCv.notify_one();
     }
 
+    void setHasHalted( bool to ) {
+        std::lock_guard< std::mutex > lock( hasHaltedMut );
+        hasHalted = to;
+    }
+
 public:
     bool stopWhenNoInput{ false };
 
@@ -301,6 +306,8 @@ public:
         memory = initial;
         std::queue< bigint >().swap( input );
         std::queue< bigint >().swap( output );
+
+
     }
 
     void pushInput( const bigint &in ) {
@@ -335,6 +342,12 @@ public:
     bool isDone() {
         std::lock_guard< std::mutex > lock( isRunningMut );
         return !isRunning;
+    }
+
+
+    bool isHalted() {
+        std::lock_guard< std::mutex > lock( hasHaltedMut );
+        return hasHalted;
     }
 };
 
@@ -389,12 +402,11 @@ int main() {
     do {
         auto execution = program.start();
 
-        while ( !program.isDone()) {
+        bigint out;
+        while ( program.popOutput( out )) {
             Point pos{};
             int id;
-            bigint out;
 
-            if ( !program.popOutput( out )) break;
             pos.x = static_cast<int>(out);
 
             if ( !program.popOutput( out )) break;
@@ -483,10 +495,7 @@ int main() {
             program.pushInput( 0 );
         }
 
-    } while ( nBlocks > 0 );
-
-
-    std::cout << score << std::endl;
+    } while ( !program.isHalted() );
 
     return 0;
 }
